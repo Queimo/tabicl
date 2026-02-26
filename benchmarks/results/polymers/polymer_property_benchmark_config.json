@@ -1,0 +1,26 @@
+{
+  "n_folds": 20,
+  "random_state": 42,
+  "n_morgan_bits": 1024,
+  "smoke_test": true,
+  "max_datasets": 1,
+  "max_folds": 1,
+  "tg_path": null,
+  "polycl_repo": "https://github.com/JiajunZhou96/PolyCL",
+  "prepared_polycl_datasets": [
+    "EPS",
+    "EPS_enum",
+    "Eea",
+    "Eea_enum",
+    "Egb",
+    "Egb_enum",
+    "Egc",
+    "Egc_enum",
+    "Ei",
+    "Ei_enum",
+    "Nc",
+    "Nc_enum",
+    "Xc",
+    "Xc_enum"
+  ]
+}
