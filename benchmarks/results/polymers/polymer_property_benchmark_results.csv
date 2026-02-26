@@ -1,0 +1,3 @@
+dataset,featurizer,fold,model,n_train,n_test,n_features,rmse,mae,r2,runtime_s
+smoke_polymer,morgan,1,RF,9,1,1024,0.0510533487846454,0.0510533487846454,,0.4145667552947998
+smoke_polymer,mordred,1,RF,9,1,1242,0.016387207057740993,0.016387207057740993,,0.4564652442932129
