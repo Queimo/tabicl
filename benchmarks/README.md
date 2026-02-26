@@ -38,6 +38,8 @@ Full run (all Polaris + MoleculeACE, 20-fold CV):
 
 ```bash
 python -u benchmarks/mega_molecular_benchmark.py --n-folds 20
+# optionally restrict model set for faster runs
+python -u benchmarks/mega_molecular_benchmark.py --n-folds 20 --models RF
 ```
 
 ### Outputs
@@ -83,6 +85,8 @@ Full run (all PolyCL-derived polymetrics + optional Tg):
 
 ```bash
 python -u benchmarks/polymer_property_prediction_benchmark.py --n-folds 20 --tg-path path/to/Tg.csv
+# optionally restrict model set for faster runs
+python -u benchmarks/polymer_property_prediction_benchmark.py --n-folds 20 --models RF
 ```
 
 
@@ -104,3 +108,6 @@ Outputs under `benchmarks/results/polycl_reproduction/`:
 - `rfecfp_5fold_summary.csv`
 - `rfecfp_reproduction_report.md`
 - `rfecfp_config.json`
+
+
+Both benchmark scripts accept `--models` as a comma-separated subset of `TabICL,XGBoost,CatBoost,RF`.

@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tg-path", type=Path, default=None, help="Path to T_g CSV (columns: smiles + target/value/tg)")
     p.add_argument("--smoke-test", action="store_true")
     p.add_argument("--prepare-only", action="store_true")
+    p.add_argument("--models", type=str, default="TabICL,XGBoost,CatBoost,RF", help="Comma-separated subset of TabICL,XGBoost,CatBoost,RF")
     return p.parse_args()
 
 
@@ -139,9 +140,9 @@ def load_all_datasets(tg_path: Path | None, smoke_test: bool) -> list[DatasetPac
 
     packs: list[DatasetPack] = []
     for csv_path in sorted(POLYMETRICS_DIR.glob("*.csv")):
-        if csv_path.name == "manifest.json":
-            continue
         df = pd.read_csv(csv_path)
+        if not {"smiles", "target"}.issubset(df.columns):
+            continue
         packs.append(DatasetPack(csv_path.stem, df["smiles"].astype(str), df["target"].to_numpy(dtype=np.float32)))
 
     auto_tg = POLYMETRICS_DIR / "Tg.csv"
@@ -198,8 +199,8 @@ def featurize_mordred(smiles: pd.Series) -> tuple[np.ndarray, list[int]]:
     return X.astype(np.float32), keep
 
 
-def models(random_state: int):
-    return {
+def models(random_state: int, selected: set[str]):
+    all_models = {
         "TabICL": lambda: TabICLRegressor(n_estimators=1, random_state=random_state),
         "XGBoost": lambda: XGBRegressor(
             n_estimators=200,
@@ -224,6 +225,7 @@ def models(random_state: int):
             n_jobs=-1,
         ),
     }
+    return {k: v for k, v in all_models.items() if k in selected}
 
 
 def run_cv(
@@ -234,6 +236,7 @@ def run_cv(
     n_folds: int,
     max_folds: int | None,
     random_state: int,
+    selected_models: set[str],
 ) -> list[dict]:
     y = np.asarray(y)
     valid = np.isfinite(y)
@@ -247,7 +250,7 @@ def run_cv(
         if max_folds is not None and fold > max_folds:
             break
         X_tr, X_te, y_tr, y_te = X[tr], X[te], y[tr], y[te]
-        for model_name, ctor in models(random_state).items():
+        for model_name, ctor in models(random_state, selected_models).items():
             print(f"Running {dataset_name} | {featurizer} | fold {fold} | {model_name}", flush=True)
             model = ctor()
             t0 = time.time()
@@ -287,18 +290,19 @@ def main() -> None:
     if args.max_datasets is not None:
         packs = packs[: args.max_datasets]
 
+    selected_models = {x.strip() for x in args.models.split(",") if x.strip()}
     records = []
     for pack in packs:
         X_morgan, idx_m = featurize_morgan(pack.smiles, args.n_morgan_bits)
         y_m = pack.y[np.array(idx_m)]
         records.extend(
-            run_cv(pack.name, X_morgan, y_m, "morgan", args.n_folds, args.max_folds, args.random_state)
+            run_cv(pack.name, X_morgan, y_m, "morgan", args.n_folds, args.max_folds, args.random_state, selected_models)
         )
 
         X_mordred, idx_d = featurize_mordred(pack.smiles)
         y_d = pack.y[np.array(idx_d)]
         records.extend(
-            run_cv(pack.name, X_mordred, y_d, "mordred", args.n_folds, args.max_folds, args.random_state)
+            run_cv(pack.name, X_mordred, y_d, "mordred", args.n_folds, args.max_folds, args.random_state, selected_models)
         )
 
     df = pd.DataFrame(records)
@@ -323,6 +327,7 @@ def main() -> None:
         "tg_path": str(args.tg_path) if args.tg_path else None,
         "polycl_repo": POLYCL_REPO,
         "prepared_polycl_datasets": created,
+        "models": sorted(selected_models),
     }
     config_path = args.output_dir / "polymer_property_benchmark_config.json"
     config_path.write_text(json.dumps(config, indent=2))

@@ -122,6 +122,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-benchmarks", type=int, default=None)
     p.add_argument("--max-folds", type=int, default=None)
     p.add_argument("--smoke-test", action="store_true")
+    p.add_argument("--models", type=str, default="TabICL,XGBoost,CatBoost,RF", help="Comma-separated subset of TabICL,XGBoost,CatBoost,RF")
     return p.parse_args()
 
 
@@ -159,10 +160,9 @@ def featurize_mordred(smiles: pd.Series) -> tuple[np.ndarray, list[int]]:
     X = SimpleImputer(strategy="median").fit_transform(desc_df)
     return X.astype(np.float32), keep_idx
 
-
-def model_factory(task: str, random_state: int) -> dict[str, Any]:
+def model_factory(task: str, random_state: int, selected: set[str]) -> dict[str, Any]:
     if task == "classification":
-        return {
+        all_models = {
             "TabICL": lambda: TabICLClassifier(n_estimators=1, random_state=random_state),
             "XGBoost": lambda: XGBClassifier(
                 n_estimators=200,
@@ -187,8 +187,9 @@ def model_factory(task: str, random_state: int) -> dict[str, Any]:
                 n_jobs=-1,
             ),
         }
+        return {k: v for k, v in all_models.items() if k in selected}
 
-    return {
+    all_models = {
         "TabICL": lambda: TabICLRegressor(n_estimators=1, random_state=random_state),
         "XGBoost": lambda: XGBRegressor(
             n_estimators=200,
@@ -213,8 +214,7 @@ def model_factory(task: str, random_state: int) -> dict[str, Any]:
             n_jobs=-1,
         ),
     }
-
-
+    return {k: v for k, v in all_models.items() if k in selected}
 def polaris_task_type(benchmark: Any, target_col: str) -> str:
     t = str(benchmark.target_types[target_col]).lower()
     return "classification" if "class" in t else "regression"
@@ -274,6 +274,7 @@ def run_dataset_cv(
     n_folds: int,
     max_folds: int | None,
     random_state: int,
+    selected_models: set[str],
 ) -> list[dict[str, Any]]:
     y = pack.y
     n_samples = len(y)
@@ -287,7 +288,7 @@ def run_dataset_cv(
         effective_folds = max(effective_folds, 2)
         splitter = KFold(n_splits=effective_folds, shuffle=True, random_state=random_state)
 
-    models = model_factory(pack.task, random_state)
+    models = model_factory(pack.task, random_state, selected_models)
     records: list[dict[str, Any]] = []
 
     for fold_id, (train_idx, test_idx) in enumerate(splitter.split(X, y), start=1):
@@ -354,8 +355,19 @@ def main() -> None:
         if args.max_benchmarks is not None:
             polaris_names = polaris_names[: args.max_benchmarks]
             moleculeace_names = moleculeace_names[: args.max_benchmarks]
-        packs = [load_polaris_dataset(x) for x in polaris_names] + [load_moleculeace_dataset(x) for x in moleculeace_names]
+        packs = []
+        for x in polaris_names:
+            try:
+                packs.append(load_polaris_dataset(x))
+            except Exception as e:
+                print(f"Skipping Polaris benchmark {x}: {e}", flush=True)
+        for x in moleculeace_names:
+            try:
+                packs.append(load_moleculeace_dataset(x))
+            except Exception as e:
+                print(f"Skipping MoleculeACE benchmark {x}: {e}", flush=True)
 
+    selected_models = {x.strip() for x in args.models.split(",") if x.strip()}
     all_records: list[dict[str, Any]] = []
     for pack in packs:
         X_morgan, keep_morgan = featurize_morgan(pack.smiles, args.n_morgan_bits)
@@ -368,6 +380,7 @@ def main() -> None:
                 n_folds=args.n_folds,
                 max_folds=args.max_folds,
                 random_state=args.random_state,
+                selected_models=selected_models,
             )
         )
 
@@ -381,6 +394,7 @@ def main() -> None:
                 n_folds=args.n_folds,
                 max_folds=args.max_folds,
                 random_state=args.random_state,
+                selected_models=selected_models,
             )
         )
 
@@ -407,6 +421,7 @@ def main() -> None:
         "n_moleculeace_benchmarks": len(MOLECULEACE_BENCHMARKS),
         "polaris_benchmarks": POLARIS_BENCHMARKS,
         "moleculeace_benchmarks": MOLECULEACE_BENCHMARKS,
+        "models": sorted(selected_models),
     }
     config_path = args.output_dir / "mega_benchmark_config.json"
     config_path.write_text(json.dumps(config, indent=2))

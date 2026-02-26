@@ -66,5 +66,8 @@
     "CHEMBL4203_Ki",
     "CHEMBL4616_EC50",
     "CHEMBL4792_Ki"
+  ],
+  "models": [
+    "RF"
   ]
 }

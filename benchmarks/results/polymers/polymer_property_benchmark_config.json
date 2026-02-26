@@ -22,5 +22,8 @@
     "Nc_enum",
     "Xc",
     "Xc_enum"
+  ],
+  "models": [
+    "RF"
   ]
 }
