@@ -1,0 +1,19 @@
+{
+  "source_repo": "https://github.com/JiajunZhou96/PolyCL",
+  "datasets": [
+    "EPS",
+    "EPS_enum",
+    "Eea",
+    "Eea_enum",
+    "Egb",
+    "Egb_enum",
+    "Egc",
+    "Egc_enum",
+    "Ei",
+    "Ei_enum",
+    "Nc",
+    "Nc_enum",
+    "Xc",
+    "Xc_enum"
+  ]
+}
