@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -94,6 +95,20 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--xgb-n-jobs", type=int, default=1, help="CPU threads for XGBoost")
     p.add_argument("--rf-n-jobs", type=int, default=1, help="CPU threads for RandomForest")
+    p.add_argument("--disable-chemprop", action="store_true", help="Disable Chemprop GNN model")
+    p.add_argument("--chemprop-bin", type=str, default="chemprop", help="Chemprop CLI executable")
+    p.add_argument("--chemprop-featurizers", choices=["morgan", "mordred", "both"], default="morgan")
+    p.add_argument("--chemprop-epochs", type=int, default=50)
+    p.add_argument("--chemprop-batch-size", type=int, default=64)
+    p.add_argument("--chemprop-num-workers", type=int, default=0)
+    p.add_argument("--chemprop-accelerator", type=str, default="cpu")
+    p.add_argument("--chemprop-devices", type=str, default="1")
+    p.add_argument(
+        "--chemprop-val-fraction",
+        type=float,
+        default=0.1,
+        help="Fraction of fold-train rows duplicated as validation rows for Chemprop",
+    )
     p.add_argument("--smoke-test", action="store_true")
     p.add_argument("--prepare-only", action="store_true")
     return p.parse_args()
@@ -323,11 +338,162 @@ def models(args: argparse.Namespace):
     }
 
 
+def sanitize_name(name: str) -> str:
+    safe = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in str(name))
+    safe = safe.strip("_")
+    return safe or "item"
+
+
+def should_run_chemprop(args: argparse.Namespace, featurizer: str) -> bool:
+    if args.disable_chemprop:
+        return False
+    return args.chemprop_featurizers == "both" or args.chemprop_featurizers == featurizer
+
+
+def run_chemprop_fold(
+    args: argparse.Namespace,
+    dataset_name: str,
+    featurizer: str,
+    fold: int,
+    train_smiles: np.ndarray,
+    train_y: np.ndarray,
+    test_smiles: np.ndarray,
+    random_state: int,
+) -> np.ndarray:
+    fold_dir = (
+        args.output_dir
+        / "chemprop_runs"
+        / sanitize_name(dataset_name)
+        / sanitize_name(featurizer)
+        / f"fold_{fold}"
+    )
+    shutil.rmtree(fold_dir, ignore_errors=True)
+    fold_dir.mkdir(parents=True, exist_ok=True)
+
+    val_fraction = float(np.clip(args.chemprop_val_fraction, 0.0, 1.0))
+    n_val = max(1, int(round(len(train_smiles) * val_fraction)))
+    n_val = min(n_val, len(train_smiles))
+    rng = np.random.default_rng(random_state + fold)
+    val_idx = rng.choice(len(train_smiles), size=n_val, replace=False)
+
+    train_df = pd.DataFrame({"smiles": train_smiles.astype(str), "target": train_y, "split": "train"})
+    if len(train_df) < 2:
+        extra = train_df.iloc[rng.choice(len(train_df), size=2 - len(train_df), replace=True)].copy()
+        extra["split"] = "train"
+        train_df = pd.concat([train_df, extra], ignore_index=True)
+
+    val_df = train_df.iloc[val_idx].copy()
+    if len(val_df) < 2:
+        extra = train_df.iloc[rng.choice(len(train_df), size=2 - len(val_df), replace=True)].copy()
+        val_df = pd.concat([val_df, extra], ignore_index=True)
+    val_df["split"] = "val"
+    fit_df = pd.concat([train_df, val_df], ignore_index=True)
+
+    fit_csv = fold_dir / "fit.csv"
+    fit_df.to_csv(fit_csv, index=False)
+
+    test_csv = fold_dir / "test.csv"
+    pd.DataFrame(
+        {
+            "smiles": test_smiles.astype(str),
+            "_row_id": np.arange(len(test_smiles), dtype=np.int32),
+        }
+    ).to_csv(test_csv, index=False)
+
+    model_dir = fold_dir / "model"
+    pred_csv = fold_dir / "predictions.csv"
+    warmup_epochs = min(2, max(0, int(args.chemprop_epochs) - 1))
+    batch_size = max(2, min(int(args.chemprop_batch_size), len(train_df)))
+
+    train_cmd = [
+        args.chemprop_bin,
+        "train",
+        "--data-path",
+        str(fit_csv),
+        "--output-dir",
+        str(model_dir),
+        "--smiles-columns",
+        "smiles",
+        "--target-columns",
+        "target",
+        "--splits-column",
+        "split",
+        "--task-type",
+        "regression",
+        "--epochs",
+        str(args.chemprop_epochs),
+        "--warmup-epochs",
+        str(warmup_epochs),
+        "--batch-size",
+        str(batch_size),
+        "--num-workers",
+        str(args.chemprop_num_workers),
+        "--accelerator",
+        str(args.chemprop_accelerator),
+        "--devices",
+        str(args.chemprop_devices),
+    ]
+
+    predict_cmd = [
+        args.chemprop_bin,
+        "predict",
+        "--test-path",
+        str(test_csv),
+        "--output",
+        str(pred_csv),
+        "--model-paths",
+        str(model_dir),
+        "--smiles-columns",
+        "smiles",
+        "--batch-size",
+        str(max(1, min(batch_size, len(test_smiles)))),
+        "--num-workers",
+        str(args.chemprop_num_workers),
+        "--accelerator",
+        str(args.chemprop_accelerator),
+        "--devices",
+        str(args.chemprop_devices),
+    ]
+
+    train_log = fold_dir / "chemprop_train.log"
+    predict_log = fold_dir / "chemprop_predict.log"
+    try:
+        with train_log.open("w") as fh:
+            subprocess.run(train_cmd, check=True, stdout=fh, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Chemprop train failed for fold {fold}. See {train_log}") from exc
+
+    try:
+        with predict_log.open("w") as fh:
+            subprocess.run(predict_cmd, check=True, stdout=fh, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Chemprop predict failed for fold {fold}. See {predict_log}") from exc
+
+    pred_df = pd.read_csv(pred_csv)
+    if "_row_id" in pred_df.columns:
+        pred_df = pred_df.sort_values("_row_id")
+
+    pred_cols = [c for c in pred_df.columns if c not in {"smiles", "_row_id"}]
+    non_unc_cols = [c for c in pred_cols if not c.endswith("_unc")]
+    if "target" in non_unc_cols:
+        pred_col = "target"
+    elif len(non_unc_cols) == 1:
+        pred_col = non_unc_cols[0]
+    else:
+        raise RuntimeError(f"Unable to infer Chemprop prediction column from {pred_cols} in {pred_csv}")
+
+    pred = pd.to_numeric(pred_df[pred_col], errors="coerce").to_numpy(dtype=np.float32)
+    if len(pred) != len(test_smiles) or np.isnan(pred).any():
+        raise RuntimeError(f"Invalid Chemprop predictions in {pred_csv}: shape={pred.shape}, n_test={len(test_smiles)}")
+    return pred
+
+
 def run_cv(
     args: argparse.Namespace,
     dataset_name: str,
     X: np.ndarray,
     y: np.ndarray,
+    smiles: np.ndarray | None,
     featurizer: str,
     n_folds: int,
     max_folds: int | None,
@@ -336,6 +502,8 @@ def run_cv(
     y = np.asarray(y)
     valid = np.isfinite(y)
     X, y = X[valid], y[valid]
+    if smiles is not None:
+        smiles = np.asarray(smiles, dtype=object)[valid]
     if len(y) < 2:
         print(f"Skipping {dataset_name} | {featurizer}: not enough valid samples ({len(y)})")
         return []
@@ -390,6 +558,42 @@ def run_cv(
                 del model
                 del pred
                 trim_memory()
+
+        if should_run_chemprop(args, featurizer):
+            if smiles is None:
+                print(f"Skipping Chemprop for {dataset_name} | {featurizer}: missing SMILES")
+            else:
+                model_name = "ChempropGNN"
+                print(f"Running {dataset_name} | {featurizer} | fold {fold} | {model_name}", flush=True)
+                t0 = time.time()
+                pred = run_chemprop_fold(
+                    args=args,
+                    dataset_name=dataset_name,
+                    featurizer=featurizer,
+                    fold=fold,
+                    train_smiles=smiles[tr],
+                    train_y=y[tr],
+                    test_smiles=smiles[te],
+                    random_state=random_state,
+                )
+                dt = time.time() - t0
+                rec = {
+                    "dataset": dataset_name,
+                    "featurizer": featurizer,
+                    "fold": fold,
+                    "model": model_name,
+                    "n_train": int(len(tr)),
+                    "n_test": int(len(te)),
+                    "n_features": int(X.shape[1]),
+                    "rmse": float(np.sqrt(mean_squared_error(y[te], pred))),
+                    "mae": float(mean_absolute_error(y[te], pred)),
+                    "r2": float(r2_score(y[te], pred)) if len(y[te]) > 1 else np.nan,
+                    "runtime_s": float(dt),
+                }
+                recs.append(rec)
+                print(json.dumps(rec))
+                del pred
+                trim_memory()
     return recs
 
 
@@ -397,6 +601,16 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     TABICL_OFFLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not args.disable_chemprop:
+        resolved_chemprop = shutil.which(args.chemprop_bin)
+        if resolved_chemprop is None and not Path(args.chemprop_bin).exists():
+            raise RuntimeError(
+                f"Chemprop executable not found: '{args.chemprop_bin}'. "
+                "Activate the environment that has Chemprop or pass --chemprop-bin."
+            )
+        if resolved_chemprop is not None:
+            args.chemprop_bin = resolved_chemprop
 
     ensure_polycl_repo()
     created = normalize_polycl_datasets()
@@ -413,18 +627,40 @@ def main() -> None:
     for pack in packs:
         X_morgan, idx_m = featurize_morgan(pack.smiles, args.n_morgan_bits)
         y_m = pack.y[np.array(idx_m)]
+        smiles_m = pack.smiles.to_numpy(dtype=object)[np.array(idx_m)]
         records.extend(
-            run_cv(args, pack.name, X_morgan, y_m, "morgan", args.n_folds, args.max_folds, args.random_state)
+            run_cv(
+                args,
+                pack.name,
+                X_morgan,
+                y_m,
+                smiles_m,
+                "morgan",
+                args.n_folds,
+                args.max_folds,
+                args.random_state,
+            )
         )
-        del X_morgan, idx_m, y_m
+        del X_morgan, idx_m, y_m, smiles_m
         trim_memory()
 
         X_mordred, idx_d = featurize_mordred(pack.smiles)
         y_d = pack.y[np.array(idx_d)]
+        smiles_d = pack.smiles.to_numpy(dtype=object)[np.array(idx_d)]
         records.extend(
-            run_cv(args, pack.name, X_mordred, y_d, "mordred", args.n_folds, args.max_folds, args.random_state)
+            run_cv(
+                args,
+                pack.name,
+                X_mordred,
+                y_d,
+                smiles_d,
+                "mordred",
+                args.n_folds,
+                args.max_folds,
+                args.random_state,
+            )
         )
-        del X_mordred, idx_d, y_d
+        del X_mordred, idx_d, y_d, smiles_d
         trim_memory()
 
     df = pd.DataFrame(records)
@@ -452,6 +688,15 @@ def main() -> None:
         "tabicl_max_train_rows": args.tabicl_max_train_rows,
         "xgb_n_jobs": args.xgb_n_jobs,
         "rf_n_jobs": args.rf_n_jobs,
+        "disable_chemprop": args.disable_chemprop,
+        "chemprop_bin": args.chemprop_bin,
+        "chemprop_featurizers": args.chemprop_featurizers,
+        "chemprop_epochs": args.chemprop_epochs,
+        "chemprop_batch_size": args.chemprop_batch_size,
+        "chemprop_num_workers": args.chemprop_num_workers,
+        "chemprop_accelerator": args.chemprop_accelerator,
+        "chemprop_devices": args.chemprop_devices,
+        "chemprop_val_fraction": args.chemprop_val_fraction,
         "tg_path": str(args.tg_path) if args.tg_path else None,
         "polycl_repo": POLYCL_REPO,
         "prepared_polycl_datasets": created,
