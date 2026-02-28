@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib.util
 import json
 import subprocess
 import sys
@@ -42,6 +43,8 @@ from xgboost import XGBRegressor
 
 POLYCL_REPO = "https://github.com/JiajunZhou96/PolyCL"
 POLYCL_LOCAL = Path("benchmarks/.cache/PolyCL")
+CHEMELEON_REPO = "https://github.com/JacksonBurns/chemeleon"
+CHEMELEON_LOCAL = Path("benchmarks/.cache/chemeleon")
 POLYMETRICS_DIR = Path("benchmarks/datasets/polymetrics")
 DEFAULT_OUTPUT_DIR = Path("benchmarks/results/polymers")
 TABICL_OFFLOAD_DIR = Path("benchmarks/.cache/tabicl_offload")
@@ -59,6 +62,16 @@ try:
     LIBC = ctypes.CDLL("libc.so.6")
 except Exception:
     LIBC = None
+
+try:
+    from fastprop.defaults import DESCRIPTOR_SET_LOOKUP
+    from fastprop.descriptors import get_descriptors
+except Exception:
+    DESCRIPTOR_SET_LOOKUP = None
+    get_descriptors = None
+
+
+_CHEMELEON_FINGERPRINT = None
 
 
 @dataclass
@@ -123,6 +136,20 @@ def ensure_polycl_repo() -> None:
                 f"Unable to clone PolyCL repository from {POLYCL_REPO}. "
                 "Please provide internet access or pre-populate benchmarks/.cache/PolyCL."
             ) from exc
+
+
+def ensure_chemeleon_repo() -> None:
+    if CHEMELEON_LOCAL.exists():
+        try:
+            subprocess.run(["git", "-C", str(CHEMELEON_LOCAL), "pull", "--ff-only"], check=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"Warning: unable to update cached chemeleon repo ({exc}). Using local cache at {CHEMELEON_LOCAL}.")
+    else:
+        CHEMELEON_LOCAL.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(["git", "clone", "--depth", "1", CHEMELEON_REPO, str(CHEMELEON_LOCAL)], check=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"Warning: unable to clone chemeleon repository from {CHEMELEON_REPO}: {exc}")
 
 
 def normalize_polycl_datasets() -> list[str]:
@@ -285,6 +312,71 @@ def featurize_mordred(smiles: pd.Series) -> tuple[np.ndarray, list[int]]:
     return X.astype(np.float32), keep
 
 
+def _load_chemeleon_fingerprint_model():
+    global _CHEMELEON_FINGERPRINT
+    if _CHEMELEON_FINGERPRINT is not None:
+        return _CHEMELEON_FINGERPRINT
+
+    fp_module = CHEMELEON_LOCAL / "chemeleon_fingerprint.py"
+    if not fp_module.exists():
+        return None
+
+    spec = importlib.util.spec_from_file_location("chemeleon_fingerprint", fp_module)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _CHEMELEON_FINGERPRINT = module.CheMeleonFingerprint(device="cpu")
+    return _CHEMELEON_FINGERPRINT
+
+
+def featurize_chemeleon(smiles: pd.Series) -> tuple[np.ndarray, list[int]]:
+    try:
+        fingerprint = _load_chemeleon_fingerprint_model()
+    except Exception as exc:
+        print(f"Skipping chemeleon featurizer: unable to initialize fingerprint model ({exc})")
+        return np.empty((0, 0), dtype=np.float32), []
+
+    if fingerprint is None:
+        print("Skipping chemeleon featurizer: chemeleon_fingerprint.py not available")
+        return np.empty((0, 0), dtype=np.float32), []
+
+    mols, keep = [], []
+    for idx, s in smiles.items():
+        mol = smiles_to_mol(s)
+        if mol is None:
+            continue
+        mols.append(mol)
+        keep.append(idx)
+    if not mols:
+        return np.empty((0, 0), dtype=np.float32), keep
+
+    X = fingerprint(mols)
+    return np.asarray(X, dtype=np.float32), keep
+
+
+def featurize_fastprop(smiles: pd.Series) -> tuple[np.ndarray, list[int]]:
+    if get_descriptors is None or DESCRIPTOR_SET_LOOKUP is None:
+        print("Skipping fastprop featurizer: fastprop is not installed")
+        return np.empty((0, 0), dtype=np.float32), []
+
+    mols, keep = [], []
+    for idx, s in smiles.items():
+        mol = smiles_to_mol(s)
+        if mol is None:
+            continue
+        mols.append(mol)
+        keep.append(idx)
+    if not mols:
+        return np.empty((0, 0), dtype=np.float32), keep
+
+    desc = get_descriptors(False, DESCRIPTOR_SET_LOOKUP["optimized"], mols)
+    desc = desc.replace([np.inf, -np.inf], np.nan)
+    desc = desc.loc[:, desc.isna().mean(axis=0) <= 0.4]
+    X = SimpleImputer(strategy="median").fit_transform(desc)
+    return X.astype(np.float32), keep
+
+
 def models(args: argparse.Namespace):
     return {
         "TabICL": lambda: TabICLRegressor(
@@ -399,6 +491,7 @@ def main() -> None:
     TABICL_OFFLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     ensure_polycl_repo()
+    ensure_chemeleon_repo()
     created = normalize_polycl_datasets()
 
     if args.prepare_only:
@@ -412,7 +505,7 @@ def main() -> None:
     records = []
     for pack in packs:
         X_morgan, idx_m = featurize_morgan(pack.smiles, args.n_morgan_bits)
-        y_m = pack.y[np.array(idx_m)]
+        y_m = pack.y[np.asarray(idx_m, dtype=int)]
         records.extend(
             run_cv(args, pack.name, X_morgan, y_m, "morgan", args.n_folds, args.max_folds, args.random_state)
         )
@@ -420,11 +513,27 @@ def main() -> None:
         trim_memory()
 
         X_mordred, idx_d = featurize_mordred(pack.smiles)
-        y_d = pack.y[np.array(idx_d)]
+        y_d = pack.y[np.asarray(idx_d, dtype=int)]
         records.extend(
             run_cv(args, pack.name, X_mordred, y_d, "mordred", args.n_folds, args.max_folds, args.random_state)
         )
         del X_mordred, idx_d, y_d
+        trim_memory()
+
+        X_chemeleon, idx_c = featurize_chemeleon(pack.smiles)
+        y_c = pack.y[np.asarray(idx_c, dtype=int)]
+        records.extend(
+            run_cv(args, pack.name, X_chemeleon, y_c, "chemeleon", args.n_folds, args.max_folds, args.random_state)
+        )
+        del X_chemeleon, idx_c, y_c
+        trim_memory()
+
+        X_fastprop, idx_f = featurize_fastprop(pack.smiles)
+        y_f = pack.y[np.asarray(idx_f, dtype=int)]
+        records.extend(
+            run_cv(args, pack.name, X_fastprop, y_f, "fastprop", args.n_folds, args.max_folds, args.random_state)
+        )
+        del X_fastprop, idx_f, y_f
         trim_memory()
 
     df = pd.DataFrame(records)
@@ -454,6 +563,7 @@ def main() -> None:
         "rf_n_jobs": args.rf_n_jobs,
         "tg_path": str(args.tg_path) if args.tg_path else None,
         "polycl_repo": POLYCL_REPO,
+        "chemeleon_repo": CHEMELEON_REPO,
         "prepared_polycl_datasets": created,
     }
     config_path = args.output_dir / "polymer_property_benchmark_config.json"
