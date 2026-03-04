@@ -8,7 +8,7 @@
 ### SBATCH --mem-per-cpu=16000
 
 ### Request number of CPUs
-#SBATCH --ntasks-per-node=8
+#SBATCH --ntasks-per-node=16
 
 ### Change to the work directory
 cd $HPCWORK/tabicl/

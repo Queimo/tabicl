@@ -1,20 +1,16 @@
-"""Polymer property prediction benchmark.
+"""Fuel property prediction benchmark.
 
 Features:
 - Two featurizers: RDKit Morgan + Mordred
-- 20-fold CV (default)
-- PolyCL dataset ingestion (all CSV datasets in the repo, except pretraining corpus)
-- Optional T_g dataset ingestion
+- K-fold CV (default: 5)
+- Single CSV ingestion split into three single-task datasets (DCN, RON, MON)
 
 Typical usage:
-1) Prepare PolyCL-derived polymetrics datasets:
-   python -u benchmarks/polymer_property_prediction_benchmark.py --prepare-only
+1) Smoke test pipeline:
+   python -u benchmarks/fuel_property_prediction_benchmark.py --smoke-test --max-folds 1
 
-2) Smoke test pipeline:
-   python -u benchmarks/polymer_property_prediction_benchmark.py --smoke-test --max-folds 1
-
-3) Full run (all prepared datasets + T_g if provided):
-   python -u benchmarks/polymer_property_prediction_benchmark.py --tg-path path/to/Tg.csv
+2) Full run on DCN/RON/MON:
+   python -u benchmarks/fuel_property_prediction_benchmark.py
 """
 
 from __future__ import annotations
@@ -42,10 +38,9 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold
 from xgboost import XGBRegressor
 
-POLYCL_REPO = "https://github.com/JiajunZhou96/PolyCL"
-POLYCL_LOCAL = Path("benchmarks/.cache/PolyCL")
-POLYMETRICS_DIR = Path("benchmarks/datasets/polymetrics")
-DEFAULT_OUTPUT_DIR = Path("benchmarks/results/polymers")
+DEFAULT_DATASET_PATH = Path("benchmarks/datasets/dcn_ron_mon.csv")
+TARGET_COLUMNS = ("DCN", "RON", "MON")
+DEFAULT_OUTPUT_DIR = Path("benchmarks/results/fuels")
 TABICL_OFFLOAD_DIR = Path("benchmarks/.cache/tabicl_offload")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +67,7 @@ class DatasetPack:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
+    p.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--random-state", type=int, default=42)
     p.add_argument("--n-folds", type=int, default=5)
@@ -85,7 +81,6 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--n-morgan-bits", type=int, default=1024)
     p.add_argument("--max-datasets", type=int, default=None)
-    p.add_argument("--tg-path", type=Path, default=None, help="Path to T_g CSV (columns: smiles + target/value/tg)")
     p.add_argument("--tabicl-batch-size", type=int, default=4, help="TabICL inference batch size (lower = less RAM)")
     p.add_argument(
         "--tabicl-offload-mode",
@@ -129,7 +124,6 @@ def parse_args() -> argparse.Namespace:
         help="Fraction of fold-train rows duplicated as validation rows for Chemprop",
     )
     p.add_argument("--smoke-test", action="store_true")
-    p.add_argument("--prepare-only", action="store_true")
     return p.parse_args()
 
 
@@ -142,96 +136,33 @@ def trim_memory() -> None:
             pass
 
 
-def ensure_polycl_repo() -> None:
-    if POLYCL_LOCAL.exists():
-        try:
-            subprocess.run(["git", "-C", str(POLYCL_LOCAL), "pull", "--ff-only"], check=True)
-        except subprocess.CalledProcessError as exc:
-            print(f"Warning: unable to update cached PolyCL repo ({exc}). Using local cache at {POLYCL_LOCAL}.")
-    else:
-        POLYCL_LOCAL.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            subprocess.run(["git", "clone", "--depth", "1", POLYCL_REPO, str(POLYCL_LOCAL)], check=True)
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"Unable to clone PolyCL repository from {POLYCL_REPO}. "
-                "Please provide internet access or pre-populate benchmarks/.cache/PolyCL."
-            ) from exc
+def infer_smiles_column(df: pd.DataFrame) -> str:
+    candidates = ["smiles", "SMILES", "molecule_smiles", "molecule"]
+    smiles_col = next((c for c in candidates if c in df.columns), None)
+    if smiles_col is None:
+        raise ValueError(f"Unable to infer SMILES column. Columns found: {df.columns.tolist()}")
+    return smiles_col
 
 
-def normalize_polycl_datasets() -> list[str]:
-    """Create normalized polymetrics datasets for all PolyCL benchmark CSVs."""
-    src_dir = POLYCL_LOCAL / "datasets"
-    POLYMETRICS_DIR.mkdir(parents=True, exist_ok=True)
-
-    created = []
-    for csv_path in sorted(src_dir.glob("*.csv")):
-        name = csv_path.stem
-        if name == "pretrain_1m":
-            continue
-
-        df = pd.read_csv(csv_path)
-        if "smiles" in df.columns:
-            smiles_col = "smiles"
-        elif "enumeration" in df.columns:
-            smiles_col = "enumeration"
-        else:
-            continue
-
-        target_col = "value" if "value" in df.columns else None
-        if target_col is None:
-            continue
-
-        out = pd.DataFrame(
-            {
-                "dataset": name,
-                "smiles": df[smiles_col].astype(str),
-                "target": pd.to_numeric(df[target_col], errors="coerce"),
-                "source": "PolyCL",
-            }
-        ).dropna(subset=["smiles", "target"])
-
-        out_path = POLYMETRICS_DIR / f"{name}.csv"
-        out.to_csv(out_path, index=False)
-        created.append(name)
-
-    manifest = {
-        "source_repo": POLYCL_REPO,
-        "datasets": created,
-    }
-    (POLYMETRICS_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    return created
-
-
-def infer_tg_columns(df: pd.DataFrame) -> tuple[str, str]:
-    smiles_candidates = ["smiles", "SMILES", "polymer_smiles", "Polymer_SMILES", "enumeration"]
-    target_candidates = ["Tg", "tg", "T_g", "target", "value", "y"]
-
-    smiles_col = next((c for c in smiles_candidates if c in df.columns), None)
-    target_col = next((c for c in target_candidates if c in df.columns), None)
-    if smiles_col is None or target_col is None:
-        raise ValueError(
-            f"Unable to infer columns for Tg dataset. Columns found: {df.columns.tolist()}"
-        )
-    return smiles_col, target_col
-
-
-def load_all_datasets(tg_path: Path | None, smoke_test: bool) -> list[DatasetPack]:
+def load_all_datasets(dataset_path: Path, smoke_test: bool) -> list[DatasetPack]:
     if smoke_test:
         s = pd.Series(["CCO", "CCN", "CCC", "CCCl", "CCBr", "CCO", "CCN", "CCC", "CCCl", "CCBr"])  # noqa: E501
-        y = np.array([0.10, 0.20, 0.15, 0.35, 0.50, 0.12, 0.18, 0.17, 0.33, 0.55], dtype=np.float32)
-        return [DatasetPack("smoke_polymer", s, y)]
+        return [
+            DatasetPack("DCN", s, np.array([0.10, 0.20, 0.15, 0.35, 0.50, 0.12, 0.18, 0.17, 0.33, 0.55], dtype=np.float32)),
+            DatasetPack("RON", s, np.array([95.0, 98.0, 92.0, 100.0, 88.0, 96.0, 97.0, 93.0, 101.0, 89.0], dtype=np.float32)),
+            DatasetPack("MON", s, np.array([85.0, 90.0, 82.0, 94.0, 78.0, 86.0, 89.0, 83.0, 95.0, 79.0], dtype=np.float32)),
+        ]
+
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+
+    df = pd.read_csv(dataset_path)
+    smiles_col = infer_smiles_column(df)
 
     packs: list[DatasetPack] = []
-    for csv_path in sorted(POLYMETRICS_DIR.glob("*.csv")):
-        stem = csv_path.stem.lower()
-        if "template" in stem or stem.endswith("_enum"):
-            continue
-        df = pd.read_csv(csv_path)
-        try:
-            smiles_col, target_col = infer_tg_columns(df)
-        except ValueError:
-            print(f"Skipping {csv_path.name}: unable to infer smiles/target columns")
+    for target_col in TARGET_COLUMNS:
+        if target_col not in df.columns:
+            print(f"Skipping target '{target_col}': column not found in {dataset_path}")
             continue
 
         clean = pd.DataFrame(
@@ -239,40 +170,16 @@ def load_all_datasets(tg_path: Path | None, smoke_test: bool) -> list[DatasetPac
                 "smiles": df[smiles_col].astype(str),
                 "target": pd.to_numeric(df[target_col], errors="coerce"),
             }
-        ).dropna(subset=["smiles", "target"])
+        ).dropna(subset=["smiles", "target"]).reset_index(drop=True)
         if clean.empty:
-            print(f"Skipping {csv_path.name}: no valid rows after cleaning")
+            print(f"Skipping target '{target_col}': no valid rows after cleaning")
             continue
 
         packs.append(
             DatasetPack(
-                csv_path.stem,
+                target_col,
                 clean["smiles"],
                 clean["target"].to_numpy(dtype=np.float32),
-            )
-        )
-
-    auto_tg = POLYMETRICS_DIR / "Tg.csv"
-    if tg_path is None and auto_tg.exists():
-        tg_path = auto_tg
-
-    if tg_path is not None and tg_path.exists():
-        tg_df = pd.read_csv(tg_path)
-        smiles_col, target_col = infer_tg_columns(tg_df)
-        clean_tg = pd.DataFrame(
-            {
-                "smiles": tg_df[smiles_col].astype(str),
-                "target": pd.to_numeric(tg_df[target_col], errors="coerce"),
-            }
-        ).dropna(subset=["smiles", "target"])
-        if clean_tg.empty:
-            print(f"Skipping Tg dataset from {tg_path}: no valid rows after cleaning")
-            return packs
-        packs.append(
-            DatasetPack(
-                "Tg",
-                clean_tg["smiles"],
-                clean_tg["target"].to_numpy(dtype=np.float32),
             )
         )
 
@@ -598,7 +505,6 @@ def run_cv(
                 recs.append(rec)
                 print(json.dumps(rec))
             finally:
-                # Egc can be memory-heavy; aggressively release model and prediction buffers.
                 del model
                 del pred
                 trim_memory()
@@ -670,16 +576,11 @@ def main() -> None:
         if resolved_chemprop is not None:
             args.chemprop_bin = resolved_chemprop
 
-    ensure_polycl_repo()
-    created = normalize_polycl_datasets()
-
-    if args.prepare_only:
-        print(f"Prepared {len(created)} normalized PolyCL datasets in {POLYMETRICS_DIR}")
-        return
-
-    packs = load_all_datasets(tg_path=args.tg_path, smoke_test=args.smoke_test)
+    packs = load_all_datasets(dataset_path=args.dataset_path, smoke_test=args.smoke_test)
     if args.max_datasets is not None:
         packs = packs[: args.max_datasets]
+    if not packs:
+        raise RuntimeError("No usable single-task datasets were loaded. Check dataset path and target columns.")
     selected_folds = {args.fold_index} if args.fold_index is not None else None
     effective_tag = args.results_tag or (f"fold_{args.fold_index}" if args.fold_index is not None else None)
 
@@ -732,7 +633,7 @@ def main() -> None:
         )
         print("Warning: no benchmark records were generated.")
 
-    detail = output_file_with_tag(args.output_dir, "polymer_property_benchmark_results", "csv", effective_tag)
+    detail = output_file_with_tag(args.output_dir, "fuel_property_benchmark_results", "csv", effective_tag)
     df.to_csv(detail, index=False)
 
     if df.empty:
@@ -743,10 +644,12 @@ def main() -> None:
             .mean(numeric_only=True)
             .sort_values(["dataset", "featurizer", "rmse"])
         )
-    summary_path = output_file_with_tag(args.output_dir, "polymer_property_benchmark_summary", "csv", effective_tag)
+    summary_path = output_file_with_tag(args.output_dir, "fuel_property_benchmark_summary", "csv", effective_tag)
     summary.to_csv(summary_path, index=False)
 
     config = {
+        "dataset_path": str(args.dataset_path),
+        "targets": list(TARGET_COLUMNS),
         "n_folds": args.n_folds,
         "random_state": args.random_state,
         "n_morgan_bits": args.n_morgan_bits,
@@ -772,11 +675,8 @@ def main() -> None:
         "chemprop_accelerator": args.chemprop_accelerator,
         "chemprop_devices": args.chemprop_devices,
         "chemprop_val_fraction": args.chemprop_val_fraction,
-        "tg_path": str(args.tg_path) if args.tg_path else None,
-        "polycl_repo": POLYCL_REPO,
-        "prepared_polycl_datasets": created,
     }
-    config_path = output_file_with_tag(args.output_dir, "polymer_property_benchmark_config", "json", effective_tag)
+    config_path = output_file_with_tag(args.output_dir, "fuel_property_benchmark_config", "json", effective_tag)
     config_path.write_text(json.dumps(config, indent=2))
 
     print(f"Saved: {detail}")

@@ -1,20 +1,21 @@
-"""Polymer property prediction benchmark.
+"""Interaction benchmark for polymer-solvent property prediction.
 
-Features:
-- Two featurizers: RDKit Morgan + Mordred
-- 20-fold CV (default)
-- PolyCL dataset ingestion (all CSV datasets in the repo, except pretraining corpus)
-- Optional T_g dataset ingestion
+Target:
+- average_IP
 
-Typical usage:
-1) Prepare PolyCL-derived polymetrics datasets:
-   python -u benchmarks/polymer_property_prediction_benchmark.py --prepare-only
+Inputs:
+- polymer_smiles
+- solvent_smiles
+- T_K
+- volume_fraction
 
-2) Smoke test pipeline:
-   python -u benchmarks/polymer_property_prediction_benchmark.py --smoke-test --max-folds 1
+Featurizers:
+- morgan_pair: Morgan(polymer) + Morgan(solvent) + [T_K, volume_fraction]
+- mordred_pair: Mordred(polymer) + Mordred(solvent) + [T_K, volume_fraction]
 
-3) Full run (all prepared datasets + T_g if provided):
-   python -u benchmarks/polymer_property_prediction_benchmark.py --tg-path path/to/Tg.csv
+Models:
+- TabICL, XGBoost, CatBoost, RandomForest
+- Optional ChempropGNN + ChempropCheMeleon
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -41,12 +41,6 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold
 from xgboost import XGBRegressor
-
-POLYCL_REPO = "https://github.com/JiajunZhou96/PolyCL"
-POLYCL_LOCAL = Path("benchmarks/.cache/PolyCL")
-POLYMETRICS_DIR = Path("benchmarks/datasets/polymetrics")
-DEFAULT_OUTPUT_DIR = Path("benchmarks/results/polymers")
-TABICL_OFFLOAD_DIR = Path("benchmarks/.cache/tabicl_offload")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
@@ -62,16 +56,14 @@ try:
 except Exception:
     LIBC = None
 
-
-@dataclass
-class DatasetPack:
-    name: str
-    smiles: pd.Series
-    y: np.ndarray
+DEFAULT_DATASET_PATH = Path("benchmarks/datasets/polymetrics/chi_clean.csv")
+DEFAULT_OUTPUT_DIR = Path("benchmarks/results/interactions")
+TABICL_OFFLOAD_DIR = Path("benchmarks/.cache/tabicl_offload")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
+    p.add_argument("--dataset-path", type=Path, default=DEFAULT_DATASET_PATH)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--random-state", type=int, default=42)
     p.add_argument("--n-folds", type=int, default=5)
@@ -84,25 +76,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional tag appended to output filenames (e.g., fold_1)",
     )
     p.add_argument("--n-morgan-bits", type=int, default=1024)
-    p.add_argument("--max-datasets", type=int, default=None)
-    p.add_argument("--tg-path", type=Path, default=None, help="Path to T_g CSV (columns: smiles + target/value/tg)")
-    p.add_argument("--tabicl-batch-size", type=int, default=4, help="TabICL inference batch size (lower = less RAM)")
-    p.add_argument(
-        "--tabicl-offload-mode",
-        type=str,
-        choices=["auto", "cpu", "disk"],
-        default="cpu",
-        help="TabICL offload mode",
-    )
-    p.add_argument("--tabicl-n-jobs", type=int, default=1, help="CPU threads for TabICL")
-    p.add_argument(
-        "--tabicl-max-train-rows",
-        type=int,
-        default=4000,
-        help="Cap TabICL training rows per fold to reduce memory (set <=0 to disable)",
-    )
-    p.add_argument("--xgb-n-jobs", type=int, default=1, help="CPU threads for XGBoost")
-    p.add_argument("--rf-n-jobs", type=int, default=1, help="CPU threads for RandomForest")
+    p.add_argument("--featurizers", choices=["morgan", "mordred", "both"], default="both")
+    p.add_argument("--tabicl-batch-size", type=int, default=4)
+    p.add_argument("--tabicl-n-jobs", type=int, default=1)
+    p.add_argument("--tabicl-max-train-rows", type=int, default=4000)
+    p.add_argument("--xgb-n-jobs", type=int, default=1)
+    p.add_argument("--rf-n-jobs", type=int, default=1)
     p.add_argument("--disable-chemprop", action="store_true", help="Disable Chemprop GNN model")
     p.add_argument(
         "--disable-chemprop-chemeleon",
@@ -129,7 +108,6 @@ def parse_args() -> argparse.Namespace:
         help="Fraction of fold-train rows duplicated as validation rows for Chemprop",
     )
     p.add_argument("--smoke-test", action="store_true")
-    p.add_argument("--prepare-only", action="store_true")
     return p.parse_args()
 
 
@@ -142,184 +120,125 @@ def trim_memory() -> None:
             pass
 
 
-def ensure_polycl_repo() -> None:
-    if POLYCL_LOCAL.exists():
-        try:
-            subprocess.run(["git", "-C", str(POLYCL_LOCAL), "pull", "--ff-only"], check=True)
-        except subprocess.CalledProcessError as exc:
-            print(f"Warning: unable to update cached PolyCL repo ({exc}). Using local cache at {POLYCL_LOCAL}.")
-    else:
-        POLYCL_LOCAL.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            subprocess.run(["git", "clone", "--depth", "1", POLYCL_REPO, str(POLYCL_LOCAL)], check=True)
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"Unable to clone PolyCL repository from {POLYCL_REPO}. "
-                "Please provide internet access or pre-populate benchmarks/.cache/PolyCL."
-            ) from exc
+def parse_decimal_series(series: pd.Series) -> pd.Series:
+    cleaned = series.astype(str).str.strip().str.replace(",", ".", regex=False)
+    return pd.to_numeric(cleaned, errors="coerce")
 
 
-def normalize_polycl_datasets() -> list[str]:
-    """Create normalized polymetrics datasets for all PolyCL benchmark CSVs."""
-    src_dir = POLYCL_LOCAL / "datasets"
-    POLYMETRICS_DIR.mkdir(parents=True, exist_ok=True)
-
-    created = []
-    for csv_path in sorted(src_dir.glob("*.csv")):
-        name = csv_path.stem
-        if name == "pretrain_1m":
-            continue
-
-        df = pd.read_csv(csv_path)
-        if "smiles" in df.columns:
-            smiles_col = "smiles"
-        elif "enumeration" in df.columns:
-            smiles_col = "enumeration"
-        else:
-            continue
-
-        target_col = "value" if "value" in df.columns else None
-        if target_col is None:
-            continue
-
-        out = pd.DataFrame(
-            {
-                "dataset": name,
-                "smiles": df[smiles_col].astype(str),
-                "target": pd.to_numeric(df[target_col], errors="coerce"),
-                "source": "PolyCL",
-            }
-        ).dropna(subset=["smiles", "target"])
-
-        out_path = POLYMETRICS_DIR / f"{name}.csv"
-        out.to_csv(out_path, index=False)
-        created.append(name)
-
-    manifest = {
-        "source_repo": POLYCL_REPO,
-        "datasets": created,
-    }
-    (POLYMETRICS_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    return created
-
-
-def infer_tg_columns(df: pd.DataFrame) -> tuple[str, str]:
-    smiles_candidates = ["smiles", "SMILES", "polymer_smiles", "Polymer_SMILES", "enumeration"]
-    target_candidates = ["Tg", "tg", "T_g", "target", "value", "y"]
-
-    smiles_col = next((c for c in smiles_candidates if c in df.columns), None)
-    target_col = next((c for c in target_candidates if c in df.columns), None)
-    if smiles_col is None or target_col is None:
-        raise ValueError(
-            f"Unable to infer columns for Tg dataset. Columns found: {df.columns.tolist()}"
-        )
-    return smiles_col, target_col
-
-
-def load_all_datasets(tg_path: Path | None, smoke_test: bool) -> list[DatasetPack]:
+def load_dataset(path: Path, smoke_test: bool) -> pd.DataFrame:
     if smoke_test:
-        s = pd.Series(["CCO", "CCN", "CCC", "CCCl", "CCBr", "CCO", "CCN", "CCC", "CCCl", "CCBr"])  # noqa: E501
-        y = np.array([0.10, 0.20, 0.15, 0.35, 0.50, 0.12, 0.18, 0.17, 0.33, 0.55], dtype=np.float32)
-        return [DatasetPack("smoke_polymer", s, y)]
-
-    packs: list[DatasetPack] = []
-    for csv_path in sorted(POLYMETRICS_DIR.glob("*.csv")):
-        stem = csv_path.stem.lower()
-        if "template" in stem or stem.endswith("_enum"):
-            continue
-        df = pd.read_csv(csv_path)
-        try:
-            smiles_col, target_col = infer_tg_columns(df)
-        except ValueError:
-            print(f"Skipping {csv_path.name}: unable to infer smiles/target columns")
-            continue
-
-        clean = pd.DataFrame(
+        return pd.DataFrame(
             {
-                "smiles": df[smiles_col].astype(str),
-                "target": pd.to_numeric(df[target_col], errors="coerce"),
+                "polymer_smiles": ["*CC*", "*CC*", "*C=C*", "*C=C*", "*CCO*", "*CCO*"],
+                "solvent_smiles": ["CCO", "CC(C)=O", "O", "CCN", "CCO", "O"],
+                "T_K": [298.15, 308.15, 298.15, 313.15, 303.15, 323.15],
+                "volume_fraction": [0.1, 0.3, 0.2, 0.4, 0.15, 0.5],
+                "average_IP": [0.25, 0.15, 0.30, 0.05, 0.28, 0.10],
             }
-        ).dropna(subset=["smiles", "target"])
-        if clean.empty:
-            print(f"Skipping {csv_path.name}: no valid rows after cleaning")
-            continue
-
-        packs.append(
-            DatasetPack(
-                csv_path.stem,
-                clean["smiles"],
-                clean["target"].to_numpy(dtype=np.float32),
-            )
         )
 
-    auto_tg = POLYMETRICS_DIR / "Tg.csv"
-    if tg_path is None and auto_tg.exists():
-        tg_path = auto_tg
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset not found: {path}")
 
-    if tg_path is not None and tg_path.exists():
-        tg_df = pd.read_csv(tg_path)
-        smiles_col, target_col = infer_tg_columns(tg_df)
-        clean_tg = pd.DataFrame(
-            {
-                "smiles": tg_df[smiles_col].astype(str),
-                "target": pd.to_numeric(tg_df[target_col], errors="coerce"),
-            }
-        ).dropna(subset=["smiles", "target"])
-        if clean_tg.empty:
-            print(f"Skipping Tg dataset from {tg_path}: no valid rows after cleaning")
-            return packs
-        packs.append(
-            DatasetPack(
-                "Tg",
-                clean_tg["smiles"],
-                clean_tg["target"].to_numpy(dtype=np.float32),
-            )
-        )
+    df = pd.read_csv(path)
+    df = df.loc[:, [c for c in df.columns if not c.lower().startswith("unnamed:")]]
+    required = ["polymer_smiles", "solvent_smiles", "T_K", "volume_fraction", "average_IP"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}. Found columns: {df.columns.tolist()}")
 
-    return packs
+    clean = pd.DataFrame(
+        {
+            "polymer_smiles": df["polymer_smiles"].astype(str).str.strip(),
+            "solvent_smiles": df["solvent_smiles"].astype(str).str.strip(),
+            "T_K": parse_decimal_series(df["T_K"]),
+            "volume_fraction": parse_decimal_series(df["volume_fraction"]),
+            "average_IP": parse_decimal_series(df["average_IP"]),
+        }
+    )
+    clean = clean.replace({"polymer_smiles": {"": np.nan}, "solvent_smiles": {"": np.nan}})
+    clean = clean.dropna(subset=["polymer_smiles", "solvent_smiles", "T_K", "volume_fraction", "average_IP"])
+    clean = clean.reset_index(drop=True)
+    return clean
 
 
 def smiles_to_mol(smiles: str):
     return Chem.MolFromSmiles(smiles)
 
 
-def featurize_morgan(smiles: pd.Series, n_bits: int) -> tuple[np.ndarray, list[int]]:
-    rows, keep = [], []
-    for idx, s in smiles.items():
-        mol = smiles_to_mol(s)
-        if mol is None:
+def featurize_morgan_pair(df: pd.DataFrame, n_bits: int) -> tuple[np.ndarray, np.ndarray]:
+    rows = []
+    keep_idx = []
+    for idx, row in df.iterrows():
+        polymer = smiles_to_mol(row["polymer_smiles"])
+        solvent = smiles_to_mol(row["solvent_smiles"])
+        if polymer is None or solvent is None:
             continue
-        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=n_bits)
-        arr = np.zeros((n_bits,), dtype=np.float32)
-        Chem.DataStructs.ConvertToNumpyArray(fp, arr)
-        rows.append(arr)
-        keep.append(idx)
+
+        fp_poly = AllChem.GetMorganFingerprintAsBitVect(polymer, radius=2, nBits=n_bits)
+        fp_solvent = AllChem.GetMorganFingerprintAsBitVect(solvent, radius=2, nBits=n_bits)
+
+        arr_poly = np.zeros((n_bits,), dtype=np.float32)
+        arr_solvent = np.zeros((n_bits,), dtype=np.float32)
+        Chem.DataStructs.ConvertToNumpyArray(fp_poly, arr_poly)
+        Chem.DataStructs.ConvertToNumpyArray(fp_solvent, arr_solvent)
+
+        numeric = np.array([row["T_K"], row["volume_fraction"]], dtype=np.float32)
+        feat = np.concatenate([arr_poly, arr_solvent, numeric], axis=0)
+        rows.append(feat)
+        keep_idx.append(idx)
+
     if not rows:
-        return np.empty((0, n_bits), dtype=np.float32), keep
-    return np.vstack(rows), keep
+        return np.empty((0, 2 * n_bits + 2), dtype=np.float32), np.array([], dtype=int)
+    return np.vstack(rows), np.array(keep_idx, dtype=int)
 
 
-def featurize_mordred(smiles: pd.Series) -> tuple[np.ndarray, list[int]]:
+def build_mordred_lookup(smiles_values: pd.Series) -> dict[str, np.ndarray]:
     calc = Calculator(descriptors, ignore_3D=True)
-    mols, keep = [], []
-    for idx, s in smiles.items():
+    unique_smiles = pd.Series(smiles_values.astype(str).unique())
+    mols = []
+    valid_smiles = []
+    for s in unique_smiles:
         mol = smiles_to_mol(s)
         if mol is None:
             continue
+        valid_smiles.append(s)
         mols.append(mol)
-        keep.append(idx)
+
     if not mols:
-        return np.empty((0, 0), dtype=np.float32), keep
+        return {}
 
     desc = calc.pandas(mols, nproc=1)
     desc = desc.apply(pd.to_numeric, errors="coerce")
     desc = desc.replace([np.inf, -np.inf], np.nan)
     desc = desc.loc[:, desc.isna().mean(axis=0) <= 0.4]
-    X = SimpleImputer(strategy="median").fit_transform(desc)
-    return X.astype(np.float32), keep
+    X = SimpleImputer(strategy="median").fit_transform(desc).astype(np.float32)
+    return {s: X[i] for i, s in enumerate(valid_smiles)}
 
 
-def models(args: argparse.Namespace):
+def featurize_mordred_pair(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    poly_lookup = build_mordred_lookup(df["polymer_smiles"])
+    solvent_lookup = build_mordred_lookup(df["solvent_smiles"])
+    if not poly_lookup or not solvent_lookup:
+        return np.empty((0, 0), dtype=np.float32), np.array([], dtype=int)
+
+    rows = []
+    keep_idx = []
+    for idx, row in df.iterrows():
+        p = poly_lookup.get(row["polymer_smiles"])
+        s = solvent_lookup.get(row["solvent_smiles"])
+        if p is None or s is None:
+            continue
+        numeric = np.array([row["T_K"], row["volume_fraction"]], dtype=np.float32)
+        rows.append(np.concatenate([p, s, numeric], axis=0))
+        keep_idx.append(idx)
+
+    if not rows:
+        return np.empty((0, 0), dtype=np.float32), np.array([], dtype=int)
+    return np.vstack(rows).astype(np.float32), np.array(keep_idx, dtype=int)
+
+
+def model_builders(args: argparse.Namespace) -> dict:
     return {
         "TabICL": lambda: TabICLRegressor(
             n_estimators=1,
@@ -327,7 +246,7 @@ def models(args: argparse.Namespace):
             device="cpu",
             n_jobs=args.tabicl_n_jobs,
             batch_size=args.tabicl_batch_size,
-            offload_mode=args.tabicl_offload_mode,
+            offload_mode="cpu",
             disk_offload_dir=str(TABICL_OFFLOAD_DIR),
         ),
         "XGBoost": lambda: XGBRegressor(
@@ -366,15 +285,17 @@ def sanitize_name(name: str) -> str:
 def should_run_chemprop(args: argparse.Namespace, featurizer: str) -> bool:
     if args.disable_chemprop:
         return False
-    return args.chemprop_featurizers == "both" or args.chemprop_featurizers == featurizer
+    if args.chemprop_featurizers == "both":
+        return True
+    if args.chemprop_featurizers == "morgan":
+        return featurizer == "morgan_pair"
+    return featurizer == "mordred_pair"
 
 
 def chemprop_variants(args: argparse.Namespace) -> list[tuple[str, str, str | None]]:
     variants: list[tuple[str, str, str | None]] = [("ChempropGNN", "chemprop_default", None)]
     if not args.disable_chemprop_chemeleon:
-        variants.append(
-            ("ChempropCheMeleon", "chemprop_chemeleon", args.chemprop_chemeleon_name)
-        )
+        variants.append(("ChempropCheMeleon", "chemprop_chemeleon", args.chemprop_chemeleon_name))
     return variants
 
 
@@ -383,9 +304,9 @@ def run_chemprop_fold(
     dataset_name: str,
     featurizer: str,
     fold: int,
-    train_smiles: np.ndarray,
+    train_rows: pd.DataFrame,
     train_y: np.ndarray,
-    test_smiles: np.ndarray,
+    test_rows: pd.DataFrame,
     random_state: int,
     run_name: str,
     from_foundation: str | None,
@@ -408,12 +329,14 @@ def run_chemprop_fold(
     fold_dir.mkdir(parents=True, exist_ok=True)
 
     val_fraction = float(np.clip(args.chemprop_val_fraction, 0.0, 1.0))
-    n_val = max(1, int(round(len(train_smiles) * val_fraction)))
-    n_val = min(n_val, len(train_smiles))
+    n_val = max(1, int(round(len(train_rows) * val_fraction)))
+    n_val = min(n_val, len(train_rows))
     rng = np.random.default_rng(random_state + fold)
-    val_idx = rng.choice(len(train_smiles), size=n_val, replace=False)
+    val_idx = rng.choice(len(train_rows), size=n_val, replace=False)
 
-    train_df = pd.DataFrame({"smiles": train_smiles.astype(str), "target": train_y, "split": "train"})
+    train_df = train_rows.copy().reset_index(drop=True)
+    train_df["target"] = train_y
+    train_df["split"] = "train"
     if len(train_df) < 2:
         extra = train_df.iloc[rng.choice(len(train_df), size=2 - len(train_df), replace=True)].copy()
         extra["split"] = "train"
@@ -429,13 +352,10 @@ def run_chemprop_fold(
     fit_csv = fold_dir / "fit.csv"
     fit_df.to_csv(fit_csv, index=False)
 
+    test_df = test_rows.copy().reset_index(drop=True)
+    test_df["_row_id"] = np.arange(len(test_df), dtype=np.int32)
     test_csv = fold_dir / "test.csv"
-    pd.DataFrame(
-        {
-            "smiles": test_smiles.astype(str),
-            "_row_id": np.arange(len(test_smiles), dtype=np.int32),
-        }
-    ).to_csv(test_csv, index=False)
+    test_df.to_csv(test_csv, index=False)
 
     model_dir = fold_dir / "model"
     pred_csv = fold_dir / "predictions.csv"
@@ -450,7 +370,11 @@ def run_chemprop_fold(
         "--output-dir",
         str(model_dir),
         "--smiles-columns",
-        "smiles",
+        "polymer_smiles",
+        "solvent_smiles",
+        "--descriptors-columns",
+        "T_K",
+        "volume_fraction",
         "--target-columns",
         "target",
         "--splits-column",
@@ -483,9 +407,13 @@ def run_chemprop_fold(
         "--model-paths",
         str(model_dir),
         "--smiles-columns",
-        "smiles",
+        "polymer_smiles",
+        "solvent_smiles",
+        "--descriptors-columns",
+        "T_K",
+        "volume_fraction",
         "--batch-size",
-        str(max(1, min(batch_size, len(test_smiles)))),
+        str(max(1, min(batch_size, len(test_rows)))),
         "--num-workers",
         str(args.chemprop_num_workers),
         "--accelerator",
@@ -512,7 +440,7 @@ def run_chemprop_fold(
     if "_row_id" in pred_df.columns:
         pred_df = pred_df.sort_values("_row_id")
 
-    pred_cols = [c for c in pred_df.columns if c not in {"smiles", "_row_id"}]
+    pred_cols = [c for c in pred_df.columns if c not in {"polymer_smiles", "solvent_smiles", "T_K", "volume_fraction", "_row_id"}]
     non_unc_cols = [c for c in pred_cols if not c.endswith("_unc")]
     if "target" in non_unc_cols:
         pred_col = "target"
@@ -522,8 +450,8 @@ def run_chemprop_fold(
         raise RuntimeError(f"Unable to infer Chemprop prediction column from {pred_cols} in {pred_csv}")
 
     pred = pd.to_numeric(pred_df[pred_col], errors="coerce").to_numpy(dtype=np.float32)
-    if len(pred) != len(test_smiles) or np.isnan(pred).any():
-        raise RuntimeError(f"Invalid Chemprop predictions in {pred_csv}: shape={pred.shape}, n_test={len(test_smiles)}")
+    if len(pred) != len(test_rows) or np.isnan(pred).any():
+        raise RuntimeError(f"Invalid Chemprop predictions in {pred_csv}: shape={pred.shape}, n_test={len(test_rows)}")
     return pred
 
 
@@ -532,26 +460,31 @@ def run_cv(
     dataset_name: str,
     X: np.ndarray,
     y: np.ndarray,
-    smiles: np.ndarray | None,
     featurizer: str,
+    rows_for_chemprop: pd.DataFrame | None,
     n_folds: int,
     max_folds: int | None,
     random_state: int,
     selected_folds: set[int] | None = None,
 ) -> list[dict]:
-    y = np.asarray(y)
-    valid = np.isfinite(y)
-    X, y = X[valid], y[valid]
-    if smiles is not None:
-        smiles = np.asarray(smiles, dtype=object)[valid]
     if len(y) < 2:
-        print(f"Skipping {dataset_name} | {featurizer}: not enough valid samples ({len(y)})")
+        print(f"Skipping {dataset_name} | {featurizer}: not enough rows ({len(y)})")
+        return []
+
+    y = np.asarray(y, dtype=np.float32)
+    valid = np.isfinite(y)
+    X = X[valid]
+    y = y[valid]
+    if rows_for_chemprop is not None:
+        rows_for_chemprop = rows_for_chemprop.iloc[np.where(valid)[0]].reset_index(drop=True)
+    if len(y) < 2:
+        print(f"Skipping {dataset_name} | {featurizer}: no valid target values after filtering")
         return []
 
     effective_folds = max(2, min(n_folds, len(y)))
     kf = KFold(n_splits=effective_folds, shuffle=True, random_state=random_state)
 
-    recs = []
+    records: list[dict] = []
     executed_folds: set[int] = set()
     for fold, (tr, te) in enumerate(kf.split(X, y), start=1):
         if max_folds is not None and fold > max_folds:
@@ -559,27 +492,23 @@ def run_cv(
         if selected_folds is not None and fold not in selected_folds:
             continue
         executed_folds.add(fold)
-        X_tr, X_te, y_tr, y_te = X[tr], X[te], y[tr], y[te]
-        for model_name, ctor in models(args).items():
+
+        X_tr, X_te = X[tr], X[te]
+        y_tr, y_te = y[tr], y[te]
+        for model_name, builder in model_builders(args).items():
             print(f"Running {dataset_name} | {featurizer} | fold {fold} | {model_name}", flush=True)
             model = None
             pred = None
             try:
-                model = ctor()
-                t0 = time.time()
-                X_tr_fit, y_tr_fit = X_tr, y_tr
+                model = builder()
+                X_fit, y_fit = X_tr, y_tr
                 if model_name == "TabICL" and args.tabicl_max_train_rows > 0 and len(y_tr) > args.tabicl_max_train_rows:
-                    rng = np.random.default_rng(random_state + fold)
+                    rng = np.random.default_rng(args.random_state + fold)
                     sel = rng.choice(len(y_tr), size=args.tabicl_max_train_rows, replace=False)
-                    X_tr_fit = X_tr[sel]
-                    y_tr_fit = y_tr[sel]
-                    print(
-                        f"TabICL train rows capped: {len(y_tr)} -> {len(y_tr_fit)} "
-                        f"for {dataset_name} fold {fold}",
-                        flush=True,
-                    )
-
-                model.fit(X_tr_fit, y_tr_fit)
+                    X_fit = X_tr[sel]
+                    y_fit = y_tr[sel]
+                t0 = time.time()
+                model.fit(X_fit, y_fit)
                 pred = model.predict(X_te)
                 dt = time.time() - t0
                 rec = {
@@ -595,17 +524,16 @@ def run_cv(
                     "r2": float(r2_score(y_te, pred)) if len(y_te) > 1 else np.nan,
                     "runtime_s": float(dt),
                 }
-                recs.append(rec)
+                records.append(rec)
                 print(json.dumps(rec))
             finally:
-                # Egc can be memory-heavy; aggressively release model and prediction buffers.
                 del model
                 del pred
                 trim_memory()
 
         if should_run_chemprop(args, featurizer):
-            if smiles is None:
-                print(f"Skipping Chemprop for {dataset_name} | {featurizer}: missing SMILES")
+            if rows_for_chemprop is None:
+                print(f"Skipping Chemprop for {dataset_name} | {featurizer}: missing row metadata")
             else:
                 for model_name, run_name, from_foundation in chemprop_variants(args):
                     print(f"Running {dataset_name} | {featurizer} | fold {fold} | {model_name}", flush=True)
@@ -615,9 +543,9 @@ def run_cv(
                         dataset_name=dataset_name,
                         featurizer=featurizer,
                         fold=fold,
-                        train_smiles=smiles[tr],
+                        train_rows=rows_for_chemprop.iloc[tr].reset_index(drop=True),
                         train_y=y[tr],
-                        test_smiles=smiles[te],
+                        test_rows=rows_for_chemprop.iloc[te].reset_index(drop=True),
                         random_state=random_state,
                         run_name=run_name,
                         from_foundation=from_foundation,
@@ -636,16 +564,17 @@ def run_cv(
                         "r2": float(r2_score(y[te], pred)) if len(y[te]) > 1 else np.nan,
                         "runtime_s": float(dt),
                     }
-                    recs.append(rec)
+                    records.append(rec)
                     print(json.dumps(rec))
                     del pred
                     trim_memory()
+
     if selected_folds is not None and not executed_folds:
         print(
             f"Skipping {dataset_name} | {featurizer}: requested folds {sorted(selected_folds)} "
             f"outside available range 1..{effective_folds}"
         )
-    return recs
+    return records
 
 
 def output_file_with_tag(output_dir: Path, stem: str, suffix: str, tag: str | None) -> Path:
@@ -670,93 +599,92 @@ def main() -> None:
         if resolved_chemprop is not None:
             args.chemprop_bin = resolved_chemprop
 
-    ensure_polycl_repo()
-    created = normalize_polycl_datasets()
+    df = load_dataset(args.dataset_path, smoke_test=args.smoke_test)
+    print(f"Loaded {len(df)} rows from {args.dataset_path}")
 
-    if args.prepare_only:
-        print(f"Prepared {len(created)} normalized PolyCL datasets in {POLYMETRICS_DIR}")
-        return
-
-    packs = load_all_datasets(tg_path=args.tg_path, smoke_test=args.smoke_test)
-    if args.max_datasets is not None:
-        packs = packs[: args.max_datasets]
     selected_folds = {args.fold_index} if args.fold_index is not None else None
     effective_tag = args.results_tag or (f"fold_{args.fold_index}" if args.fold_index is not None else None)
+    dataset_name = Path(args.dataset_path).stem
+    all_records = []
 
-    records = []
-    for pack in packs:
-        X_morgan, idx_m = featurize_morgan(pack.smiles, args.n_morgan_bits)
-        y_m = pack.y[np.array(idx_m)]
-        smiles_m = pack.smiles.to_numpy(dtype=object)[np.array(idx_m)]
-        records.extend(
+    if args.featurizers in {"morgan", "both"}:
+        X_m, keep_m = featurize_morgan_pair(df, args.n_morgan_bits)
+        y_m = df.loc[keep_m, "average_IP"].to_numpy(dtype=np.float32)
+        rows_m = df.loc[keep_m, ["polymer_smiles", "solvent_smiles", "T_K", "volume_fraction"]].reset_index(drop=True)
+        all_records.extend(
             run_cv(
                 args,
-                pack.name,
-                X_morgan,
-                y_m,
-                smiles_m,
-                "morgan",
-                args.n_folds,
-                args.max_folds,
-                args.random_state,
-                selected_folds,
+                dataset_name=dataset_name,
+                X=X_m,
+                y=y_m,
+                featurizer="morgan_pair",
+                rows_for_chemprop=rows_m,
+                n_folds=args.n_folds,
+                max_folds=args.max_folds,
+                random_state=args.random_state,
+                selected_folds=selected_folds,
             )
         )
-        del X_morgan, idx_m, y_m, smiles_m
+        del X_m, keep_m, y_m, rows_m
         trim_memory()
 
-        X_mordred, idx_d = featurize_mordred(pack.smiles)
-        y_d = pack.y[np.array(idx_d)]
-        smiles_d = pack.smiles.to_numpy(dtype=object)[np.array(idx_d)]
-        records.extend(
+    if args.featurizers in {"mordred", "both"}:
+        X_d, keep_d = featurize_mordred_pair(df)
+        y_d = df.loc[keep_d, "average_IP"].to_numpy(dtype=np.float32)
+        rows_d = df.loc[keep_d, ["polymer_smiles", "solvent_smiles", "T_K", "volume_fraction"]].reset_index(drop=True)
+        all_records.extend(
             run_cv(
                 args,
-                pack.name,
-                X_mordred,
-                y_d,
-                smiles_d,
-                "mordred",
-                args.n_folds,
-                args.max_folds,
-                args.random_state,
-                selected_folds,
+                dataset_name=dataset_name,
+                X=X_d,
+                y=y_d,
+                featurizer="mordred_pair",
+                rows_for_chemprop=rows_d,
+                n_folds=args.n_folds,
+                max_folds=args.max_folds,
+                random_state=args.random_state,
+                selected_folds=selected_folds,
             )
         )
-        del X_mordred, idx_d, y_d, smiles_d
+        del X_d, keep_d, y_d, rows_d
         trim_memory()
 
-    df = pd.DataFrame(records)
-    if df.empty:
-        df = pd.DataFrame(
+    out_df = pd.DataFrame(all_records)
+    if out_df.empty:
+        out_df = pd.DataFrame(
             columns=["dataset", "featurizer", "fold", "model", "n_train", "n_test", "n_features", "rmse", "mae", "r2", "runtime_s"]
         )
         print("Warning: no benchmark records were generated.")
 
-    detail = output_file_with_tag(args.output_dir, "polymer_property_benchmark_results", "csv", effective_tag)
-    df.to_csv(detail, index=False)
+    detail_path = output_file_with_tag(args.output_dir, "interaction_benchmark_results", "csv", effective_tag)
+    out_df.to_csv(detail_path, index=False)
 
-    if df.empty:
+    if out_df.empty:
         summary = pd.DataFrame(columns=["dataset", "featurizer", "model", "rmse", "mae", "r2", "runtime_s"])
     else:
         summary = (
-            df.groupby(["dataset", "featurizer", "model"], as_index=False)[["rmse", "mae", "r2", "runtime_s"]]
+            out_df.groupby(["dataset", "featurizer", "model"], as_index=False)[["rmse", "mae", "r2", "runtime_s"]]
             .mean(numeric_only=True)
             .sort_values(["dataset", "featurizer", "rmse"])
         )
-    summary_path = output_file_with_tag(args.output_dir, "polymer_property_benchmark_summary", "csv", effective_tag)
+    summary_path = output_file_with_tag(args.output_dir, "interaction_benchmark_summary", "csv", effective_tag)
     summary.to_csv(summary_path, index=False)
 
     config = {
+        "dataset_path": str(args.dataset_path),
+        "output_dir": str(args.output_dir),
+        "n_rows_loaded": int(len(df)),
+        "target": "average_IP",
+        "feature_columns": ["polymer_smiles", "solvent_smiles", "T_K", "volume_fraction"],
         "n_folds": args.n_folds,
-        "random_state": args.random_state,
-        "n_morgan_bits": args.n_morgan_bits,
-        "smoke_test": args.smoke_test,
-        "max_datasets": args.max_datasets,
         "max_folds": args.max_folds,
         "fold_index": args.fold_index,
         "results_tag": effective_tag,
+        "random_state": args.random_state,
+        "n_morgan_bits": args.n_morgan_bits,
+        "featurizers": args.featurizers,
+        "smoke_test": args.smoke_test,
         "tabicl_batch_size": args.tabicl_batch_size,
-        "tabicl_offload_mode": args.tabicl_offload_mode,
         "tabicl_n_jobs": args.tabicl_n_jobs,
         "tabicl_max_train_rows": args.tabicl_max_train_rows,
         "xgb_n_jobs": args.xgb_n_jobs,
@@ -772,14 +700,11 @@ def main() -> None:
         "chemprop_accelerator": args.chemprop_accelerator,
         "chemprop_devices": args.chemprop_devices,
         "chemprop_val_fraction": args.chemprop_val_fraction,
-        "tg_path": str(args.tg_path) if args.tg_path else None,
-        "polycl_repo": POLYCL_REPO,
-        "prepared_polycl_datasets": created,
     }
-    config_path = output_file_with_tag(args.output_dir, "polymer_property_benchmark_config", "json", effective_tag)
+    config_path = output_file_with_tag(args.output_dir, "interaction_benchmark_config", "json", effective_tag)
     config_path.write_text(json.dumps(config, indent=2))
 
-    print(f"Saved: {detail}")
+    print(f"Saved: {detail_path}")
     print(f"Saved: {summary_path}")
     print(f"Saved: {config_path}")
 
