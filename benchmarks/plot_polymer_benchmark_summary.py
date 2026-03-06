@@ -43,7 +43,7 @@ def write_dataset_table(rows: list[dict[str, str]], out_path: Path) -> None:
             )
 
 
-def render_plot(dataset: str, table_path: Path, plot_path: Path) -> None:
+def render_plot(dataset: str, table_path: Path, plot_path: Path, benchmark_title: str = "Polymer benchmark") -> None:
     gnuplot_script = f"""
 set terminal pngcairo size 2200,1300
 set output '{plot_path.as_posix()}'
@@ -52,7 +52,7 @@ set key off
 set grid ytics lc rgb '#D9D9D9'
 set style fill solid 0.85 border -1
 set boxwidth 0.7
-set multiplot layout 2,2 title 'Polymer benchmark: {dataset}'
+set multiplot layout 2,2 title '{benchmark_title}: {dataset}'
 
 set xtics rotate by -30
 set title 'RMSE (lower is better)'
@@ -99,7 +99,7 @@ def main() -> None:
         table_path = args.output_dir / f"{dataset}_benchmark_table.tsv"
         plot_path = args.output_dir / f"{dataset}_benchmark_bars.png"
         write_dataset_table(rows, table_path)
-        render_plot(dataset=dataset, table_path=table_path, plot_path=plot_path)
+        render_plot(dataset=dataset, table_path=table_path, plot_path=plot_path, benchmark_title="Polymer benchmark")
         print(f"Saved {plot_path}")
 
 
