@@ -1,5 +1,13 @@
 # Benchmark scripts
 
+## Installation
+
+Install TabICL with the benchmark extra before running Polaris/MoleculeACE scripts:
+
+```bash
+python -m pip install -e ".[benchmarks]"
+```
+
 ## Mega molecular benchmark (Polaris + MoleculeACE)
 
 `mega_molecular_benchmark.py` implements a full experiment scaffold for:
@@ -18,8 +26,9 @@
   - CatBoost
   - Random Forest
 - Protocol:
-  - **20-fold CV** by default (`--n-folds 20`)
-  - Stratified folds for classification, standard KFold for regression
+  - **Predefined train/test splits** by default (`--protocol split`) to match CheMeleon
+  - Runs 5 seeds (`42, 117, 709, 1701, 9001`) and averages in summary
+  - Optional CV mode: `--protocol cv --n-folds 20`
 
 ### Benchmark IDs source
 
@@ -31,13 +40,19 @@ The benchmark IDs mirror the lists used in:
 Smoke test (quick wiring check):
 
 ```bash
-python -u benchmarks/mega_molecular_benchmark.py --smoke-test --n-folds 20 --max-folds 1
+python -u benchmarks/mega_molecular_benchmark.py --smoke-test --protocol cv --n-folds 20 --max-folds 1
 ```
 
-Full run (all Polaris + MoleculeACE, 20-fold CV):
+Full run (all Polaris + MoleculeACE, predefined splits, CheMeleon-comparable):
 
 ```bash
-python -u benchmarks/mega_molecular_benchmark.py --n-folds 20
+python -u benchmarks/mega_molecular_benchmark.py --protocol split
+```
+
+Optional full CV run:
+
+```bash
+python -u benchmarks/mega_molecular_benchmark.py --protocol cv --n-folds 20
 ```
 
 ### Outputs
