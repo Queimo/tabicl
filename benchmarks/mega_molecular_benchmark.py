@@ -1,7 +1,11 @@
-"""Mega-benchmark scaffold for Polaris + MoleculeACE with 20-fold CV.
+"""Mega-benchmark scaffold for Polaris + MoleculeACE.
 
-This script is intended to be *experiment ready* rather than quick to run.
-Use `--smoke-test` to validate wiring in seconds.
+Default protocol matches CheMeleon comparability:
+- use benchmark-provided train/test splits (Polaris + MoleculeACE split column)
+- evaluate across 5 seeds
+
+Use `--protocol cv` for k-fold CV.
+Use `--smoke-test` to validate wiring quickly.
 """
 
 from __future__ import annotations
@@ -103,6 +107,8 @@ MOLECULEACE_BENCHMARKS = [
     "CHEMBL4792_Ki",
 ]
 
+DEFAULT_SEEDS = [42, 117, 709, 1701, 9001]
+
 
 @dataclass
 class DatasetPack:
@@ -111,16 +117,20 @@ class DatasetPack:
     smiles: pd.Series
     y: np.ndarray
     task: str  # regression | classification
+    train_idx: np.ndarray | None = None
+    test_idx: np.ndarray | None = None
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--output-dir", type=Path, default=Path("benchmarks/results/mega"))
+    p.add_argument("--protocol", choices=["split", "cv"], default="split")
     p.add_argument("--n-folds", type=int, default=20)
     p.add_argument("--random-state", type=int, default=42)
     p.add_argument("--n-morgan-bits", type=int, default=1024)
     p.add_argument("--max-benchmarks", type=int, default=None)
     p.add_argument("--max-folds", type=int, default=None)
+    p.add_argument("--max-seeds", type=int, default=None)
     p.add_argument("--smoke-test", action="store_true")
     return p.parse_args()
 
@@ -225,12 +235,17 @@ def load_polaris_dataset(name: str) -> DatasetPack:
         raise ImportError("polaris is required for Polaris benchmark loading")
     benchmark = po.load_benchmark(name)
     train, test = benchmark.get_train_test_split()
-    df = pd.concat([train.as_dataframe(), test.as_dataframe()], ignore_index=True)
+    train_df = train.as_dataframe().reset_index(drop=True)
+    test_df = test.as_dataframe().reset_index(drop=True)
+    df = pd.concat([train_df, test_df], ignore_index=True)
     smiles_col = list(benchmark.input_cols)[0]
     target_col = list(benchmark.target_cols)[0]
     task = polaris_task_type(benchmark, target_col)
     y = df[target_col].to_numpy()
-    return DatasetPack("polaris", name, df[smiles_col], y, task)
+    n_train = len(train_df)
+    train_idx = np.arange(n_train)
+    test_idx = np.arange(n_train, len(df))
+    return DatasetPack("polaris", name, df[smiles_col], y, task, train_idx, test_idx)
 
 
 def load_moleculeace_dataset(name: str) -> DatasetPack:
@@ -239,8 +254,14 @@ def load_moleculeace_dataset(name: str) -> DatasetPack:
         "7e6de0bd2968c56589c580f2a397f01c531ede26/"
         f"MoleculeACE/Data/benchmark_data/{name}.csv"
     )
-    df = pd.read_csv(url)
-    return DatasetPack("moleculeace", name, df["smiles"], df["y"].to_numpy(), "regression")
+    df = pd.read_csv(url).reset_index(drop=True)
+    if "split" in df.columns:
+        train_idx = np.where(df["split"].to_numpy() == "train")[0]
+        test_idx = np.where(df["split"].to_numpy() == "test")[0]
+    else:
+        train_idx = None
+        test_idx = None
+    return DatasetPack("moleculeace", name, df["smiles"], df["y"].to_numpy(), "regression", train_idx, test_idx)
 
 
 def metric_row(task: str, y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray | None) -> dict[str, float]:
@@ -265,6 +286,70 @@ def metric_row(task: str, y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.nd
         "mae": float(mean_absolute_error(y_true, y_pred)),
         "r2": float(r2_score(y_true, y_pred)),
     }
+
+
+def run_dataset_split(
+    pack: DatasetPack,
+    featurizer_name: str,
+    X: np.ndarray,
+    keep_idx: list[int],
+    seeds: list[int],
+) -> list[dict[str, Any]]:
+    if pack.train_idx is None or pack.test_idx is None:
+        raise ValueError("Split protocol requires train_idx/test_idx in DatasetPack")
+
+    index_to_pos = {idx: pos for pos, idx in enumerate(keep_idx)}
+    train_pos = np.array([index_to_pos[idx] for idx in pack.train_idx if idx in index_to_pos], dtype=int)
+    test_pos = np.array([index_to_pos[idx] for idx in pack.test_idx if idx in index_to_pos], dtype=int)
+    if len(train_pos) == 0 or len(test_pos) == 0:
+        raise ValueError(f"No valid split rows after featurization for {pack.benchmark_name}/{featurizer_name}")
+
+    y = pack.y
+    records: list[dict[str, Any]] = []
+
+    for seed in seeds:
+        models = model_factory(pack.task, seed)
+        X_train, X_test = X[train_pos], X[test_pos]
+        y_train, y_test = y[train_pos], y[test_pos]
+
+        for model_name, ctor in models.items():
+            print(
+                f"Running {pack.source}/{pack.benchmark_name} | {featurizer_name} | seed {seed} | {model_name}",
+                flush=True,
+            )
+            model = ctor()
+            t0 = time.time()
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            runtime_s = time.time() - t0
+
+            y_proba = None
+            if pack.task == "classification" and hasattr(model, "predict_proba"):
+                try:
+                    proba = model.predict_proba(X_test)
+                    if proba.ndim == 2 and proba.shape[1] >= 2:
+                        y_proba = proba[:, 1]
+                except Exception:
+                    y_proba = None
+
+            rec = {
+                "source": pack.source,
+                "benchmark": pack.benchmark_name,
+                "task": pack.task,
+                "featurizer": featurizer_name,
+                "split": "predefined",
+                "seed": seed,
+                "model": model_name,
+                "n_train": int(len(train_pos)),
+                "n_test": int(len(test_pos)),
+                "n_features": int(X.shape[1]),
+                "runtime_s": float(runtime_s),
+            }
+            rec.update(metric_row(pack.task, y_test, y_pred, y_proba))
+            records.append(rec)
+            print(json.dumps(rec))
+
+    return records
 
 
 def run_dataset_cv(
@@ -322,7 +407,8 @@ def run_dataset_cv(
                 "benchmark": pack.benchmark_name,
                 "task": pack.task,
                 "featurizer": featurizer_name,
-                "fold": fold_id,
+                "split": f"cv_{fold_id}",
+                "seed": random_state,
                 "model": model_name,
                 "n_train": int(len(train_idx)),
                 "n_test": int(len(test_idx)),
@@ -356,33 +442,73 @@ def main() -> None:
             moleculeace_names = moleculeace_names[: args.max_benchmarks]
         packs = [load_polaris_dataset(x) for x in polaris_names] + [load_moleculeace_dataset(x) for x in moleculeace_names]
 
+    seeds = DEFAULT_SEEDS if args.max_seeds is None else DEFAULT_SEEDS[: args.max_seeds]
+
     all_records: list[dict[str, Any]] = []
     for pack in packs:
         X_morgan, keep_morgan = featurize_morgan(pack.smiles, args.n_morgan_bits)
-        pack_morgan = DatasetPack(pack.source, pack.benchmark_name, pack.smiles.iloc[keep_morgan], pack.y[keep_morgan], pack.task)
-        all_records.extend(
-            run_dataset_cv(
-                pack_morgan,
-                featurizer_name="morgan",
-                X=X_morgan,
-                n_folds=args.n_folds,
-                max_folds=args.max_folds,
-                random_state=args.random_state,
-            )
+        pack_morgan = DatasetPack(
+            pack.source,
+            pack.benchmark_name,
+            pack.smiles.iloc[keep_morgan],
+            pack.y[keep_morgan],
+            pack.task,
+            train_idx=pack.train_idx,
+            test_idx=pack.test_idx,
         )
+        if args.protocol == "split" and pack_morgan.train_idx is not None and not args.smoke_test:
+            all_records.extend(
+                run_dataset_split(
+                    pack_morgan,
+                    featurizer_name="morgan",
+                    X=X_morgan,
+                    keep_idx=keep_morgan,
+                    seeds=seeds,
+                )
+            )
+        else:
+            all_records.extend(
+                run_dataset_cv(
+                    pack_morgan,
+                    featurizer_name="morgan",
+                    X=X_morgan,
+                    n_folds=args.n_folds,
+                    max_folds=args.max_folds,
+                    random_state=args.random_state,
+                )
+            )
 
         X_mordred, keep_mordred = featurize_mordred(pack.smiles)
-        pack_mordred = DatasetPack(pack.source, pack.benchmark_name, pack.smiles.iloc[keep_mordred], pack.y[keep_mordred], pack.task)
-        all_records.extend(
-            run_dataset_cv(
-                pack_mordred,
-                featurizer_name="mordred",
-                X=X_mordred,
-                n_folds=args.n_folds,
-                max_folds=args.max_folds,
-                random_state=args.random_state,
-            )
+        pack_mordred = DatasetPack(
+            pack.source,
+            pack.benchmark_name,
+            pack.smiles.iloc[keep_mordred],
+            pack.y[keep_mordred],
+            pack.task,
+            train_idx=pack.train_idx,
+            test_idx=pack.test_idx,
         )
+        if args.protocol == "split" and pack_mordred.train_idx is not None and not args.smoke_test:
+            all_records.extend(
+                run_dataset_split(
+                    pack_mordred,
+                    featurizer_name="mordred",
+                    X=X_mordred,
+                    keep_idx=keep_mordred,
+                    seeds=seeds,
+                )
+            )
+        else:
+            all_records.extend(
+                run_dataset_cv(
+                    pack_mordred,
+                    featurizer_name="mordred",
+                    X=X_mordred,
+                    n_folds=args.n_folds,
+                    max_folds=args.max_folds,
+                    random_state=args.random_state,
+                )
+            )
 
     out_df = pd.DataFrame(all_records)
     detail_path = args.output_dir / "mega_benchmark_results.csv"
@@ -399,8 +525,10 @@ def main() -> None:
     summary.to_csv(summary_path, index=False)
 
     config = {
+        "protocol": args.protocol,
         "n_folds": args.n_folds,
         "random_state": args.random_state,
+        "seeds": seeds,
         "n_morgan_bits": args.n_morgan_bits,
         "smoke_test": args.smoke_test,
         "n_polaris_benchmarks": len(POLARIS_BENCHMARKS),

@@ -37,6 +37,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+benchmarks = [
+    "pandas>=2.1",
+    "catboost>=1.2",
+    "xgboost>=2.0",
+    "rdkit>=2024.3",
+    "mordred>=1.2",
+    "polaris-lib>=0.13",
+]
 forecast = [                                                                                                                                                                                                        
     "pandas>=2.1.2",
     "gluonts>=0.16.0",  # calendar features
@@ -49,7 +57,7 @@ pretrain = [
     "wandb",  # logging in pre-training
 ]
 all = [
-    "tabicl[forecast,pretrain]",
+    "tabicl[benchmarks,forecast,pretrain]",
 ]
 
 [build-system]
